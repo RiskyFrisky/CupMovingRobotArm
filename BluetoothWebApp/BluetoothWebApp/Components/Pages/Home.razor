@@ -1,0 +1,697 @@
+@page "/"
+@inject IBluetoothNavigator navigator
+@inject IJSRuntime JSRuntime
+@using MQTTnet;
+@using MQTTnet.Client;
+@using MQTTnet.Formatter
+@using MQTTnet.Protocol;
+@using System.Text.Json;
+@inject ILogger<Home> Logger
+
+<PageTitle>Robot Arm Control</PageTitle>
+
+<h1>Robot Arm Control Interface</h1>
+<p>This interface allows you to control the robot arm either through direct Bluetooth connection or via MQTT messages.
+    Use the Bluetooth section to connect directly to the device, or send MQTT messages in JSON format to control the arm
+    remotely.</p>
+
+<h3>MQTT</h3>
+<p class="@(mqttConnected ? "text-success" : "text-danger")">
+    Connection: @(mqttConnected ? "Connected" : "Disconnected")</p>
+<p class="@(subscribedToDesiredPosition ? "text-success" : "text-danger")">
+    Subscription: @(subscribedToDesiredPosition ? "Subscribed to desiredPosition" : "Not subscribed")</p>
+<p class="@(subscribedToGetPosition ? "text-success" : "text-danger")">
+    Subscription: @(subscribedToGetPosition ? "Subscribed to getPosition" : "Not subscribed")</p>
+@if (!string.IsNullOrEmpty(latestMqttMessage))
+{
+    <p>Latest Message:
+    <pre style="display: inline;">@latestMqttMessage</pre></p>
+}
+
+<h3>Bluetooth</h3>
+@if (isUserDisconnected && !isConnected)
+{
+    @if (lastSelectedDevice != null)
+    {
+        <button class="btn btn-secondary" style="margin-bottom: 10px;" @onclick="ReconnectToLastDevice">Reconnect to
+            Last Device
+        </button>
+        <p>Last Device: <strong>@lastSelectedDevice.Name</strong></p>
+    }
+
+    <button class="btn btn-primary" @onclick="GetBluetoothDevice">Get Bluetooth Device</button>
+}
+else if (!isConnected)
+{
+    <button class="btn btn-danger" @onclick="DisconnectDevice">Disconnect</button>
+    <p>Reconnecting to <strong>@device?.Name</strong>...</p>
+}
+
+@if (isConnecting)
+{
+    <p class="text-warning">Connecting to <strong>@device?.Name</strong>...</p>
+}
+else if (isConnected)
+{
+    <p class="text-success">Connected to <strong>@device?.Name</strong></p>
+    <button class="btn btn-danger" @onclick="DisconnectDevice">Disconnect</button>
+}
+
+<p>@status</p>
+
+@if (deviceInfo != null)
+{
+    <h3>Device Info</h3>
+    <pre>@deviceInfo</pre>
+}
+
+@if (!string.IsNullOrEmpty(liveDataHex))
+{
+    <h3>Live Data</h3>
+    <pre>@liveDataHex</pre>
+}
+
+@if (isConnected && writableCharacteristic != null)
+{
+    <h3>Send Data</h3>
+    <EditForm Model="@dataToSend" OnValidSubmit="SendData">
+        <div class="mb-2">
+            <label>Angle 0:</label>
+            <InputNumber @bind-Value="dataToSend.Angle0" class="form-control"/>
+            <label>Angle 1:</label>
+            <InputNumber @bind-Value="dataToSend.Angle1" class="form-control"/>
+            <label>Angle 2:</label>
+            <InputNumber @bind-Value="dataToSend.Angle2" class="form-control"/>
+            <label>Angle 3:</label>
+            <InputNumber @bind-Value="dataToSend.Angle3" class="form-control"/>
+            <label>Angle 4:</label>
+            <InputNumber @bind-Value="dataToSend.Angle4" class="form-control"/>
+        </div>
+        <div class="form-check mb-3">
+            <InputCheckbox @bind-Value="dataToSend.GripperOpen" class="form-check-input" id="gripperCheck"/>
+            <label class="form-check-label" for="gripperCheck">
+                Gripper is <strong>@(dataToSend.GripperOpen ? "OPEN" : "CLOSED")</strong>
+            </label>
+        </div>
+        <button class="btn btn-success" type="submit">Send Data</button>
+    </EditForm>
+}
+
+<div style="margin-bottom: 100px;"></div>
+
+@code {
+    private IDevice? device;
+    private string status = "";
+    private string? deviceInfo;
+    private string? liveDataHex;
+    private IBluetoothRemoteGATTCharacteristic? writableCharacteristic;
+    private bool isConnected = false;
+    private List<IBluetoothRemoteGATTCharacteristic> subscribedCharacteristics = new();
+
+    private readonly string[] serviceUuids = new[]
+    {
+        "0000a000-1212-efde-1523-785feabcd123"
+    };
+
+    private class DataModel
+    {
+        public int Angle0 { get; set; }
+        public int Angle1 { get; set; }
+        public int Angle2 { get; set; }
+        public int Angle3 { get; set; }
+        public int Angle4 { get; set; }
+        public bool GripperOpen { get; set; }
+    }
+
+    private DataModel dataToSend = new();
+
+    private IMqttClient? mqttClient;
+    private string? latestMqttMessage;
+    private bool mqttConnected = false;
+
+    private bool subscribedToDesiredPosition = false;
+    private bool subscribedToGetPosition = false;
+
+    private DataModel? lastReportedData;
+    private DeviceInfo? lastSelectedDevice;
+    private bool isConnecting = false;
+    private bool isUserDisconnected = true; // Tracks if the user intentionally disconnected the Bluetooth device
+
+    protected override async Task OnInitializedAsync()
+    {
+        await base.OnInitializedAsync();
+        _ = Task.Run(EnsureMqttConnection); // Start MQTT reconnection loop
+        _ = Task.Run(EnsureBluetoothConnection); // Start Bluetooth reconnection loop
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            // Retrieve last selected device from localStorage
+            var lastDeviceJson = await JSRuntime.InvokeAsync<string>("localStorage.getItem", "lastSelectedDevice");
+            if (!string.IsNullOrEmpty(lastDeviceJson))
+            {
+                try
+                {
+                    lastSelectedDevice = JsonSerializer.Deserialize<DeviceInfo>(lastDeviceJson);
+                }
+                catch
+                {
+                    lastSelectedDevice = null;
+                }
+            }
+
+            StateHasChanged();
+        }
+    }
+
+    private async Task EnsureMqttConnection()
+    {
+        while (true)
+        {
+            if (mqttClient == null || !mqttClient.IsConnected)
+            {
+                try
+                {
+                    await InitializeMqttClient();
+                }
+                catch
+                {
+                    // Retry after a delay if connection fails
+                }
+            }
+
+            await Task.Delay(1000); // Check every 1 second
+        }
+    }
+
+    private async Task EnsureBluetoothConnection()
+    {
+        while (true)
+        {
+            if (!isConnected && !isUserDisconnected && device != null)
+            {
+                try
+                {
+                    isConnecting = true;
+                    await InvokeAsync(StateHasChanged);
+
+                    if (device?.Gatt?.Connected == true)
+                    {
+                        await device.Gatt.Disonnect();
+                    }
+
+                    await ReconnectToLastDevice();
+                }
+                catch (Exception ex)
+                {
+                    status = $"Reconnection attempt failed: {ex.Message}";
+                    await InvokeAsync(StateHasChanged);
+                }
+                finally
+                {
+                    isConnecting = false;
+                    await InvokeAsync(StateHasChanged);
+                }
+            }
+
+            await Task.Delay(5000); // Check every 1 second
+        }
+    }
+
+    private async Task InitializeMqttClient()
+    {
+        try
+        {
+            var mqttFactory = new MqttFactory();
+            mqttClient = mqttFactory.CreateMqttClient();
+
+            var options = new MqttClientOptionsBuilder()
+                .WithTcpServer("localhost", 1883) // Replace with your MQTT broker address
+                .WithProtocolVersion(MqttProtocolVersion.V500)
+                .WithClientId($"BlazorApp_{Guid.NewGuid()}")
+                .Build();
+
+            mqttClient.ApplicationMessageReceivedAsync += async e =>
+            {
+                try
+                {
+                    var payload = System.Text.Encoding.UTF8.GetString(e.ApplicationMessage.PayloadSegment);
+                    var timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+                    latestMqttMessage = $"[{timestamp}] {e.ApplicationMessage.Topic}: {payload}";
+
+                    if (e.ApplicationMessage.Topic == "getPosition")
+                    {
+                        // Publish back on reportedPosition topic
+                        await PublishReportedPosition();
+                    }
+                    else
+                    {
+                        // Handle desiredPosition topic
+                        var dataModel = JsonSerializer.Deserialize<DataModel>(payload);
+                        if (dataModel != null && isConnected && writableCharacteristic != null)
+                        {
+                            // Update the form data
+                            dataToSend = dataModel;
+                            // Send the data to Bluetooth device
+                            await SendData();
+                            latestMqttMessage += " (Sent to Bluetooth)";
+                        }
+                    }
+                }
+                catch (JsonException)
+                {
+                    latestMqttMessage += " (Invalid JSON format)";
+                }
+                catch (Exception ex)
+                {
+                    latestMqttMessage += $" (Error: {ex.Message})";
+                }
+
+                await InvokeAsync(StateHasChanged);
+            };
+
+            await mqttClient.ConnectAsync(options);
+
+            if (mqttClient.IsConnected)
+            {
+                mqttConnected = true;
+                var subscribeOptions = new MqttClientSubscribeOptionsBuilder()
+                    .WithTopicFilter(f =>
+                    {
+                        f.WithTopic("desiredPosition");
+                        f.WithQualityOfServiceLevel(MqttQualityOfServiceLevel.ExactlyOnce);
+                    })
+                    .WithTopicFilter(f =>
+                    {
+                        f.WithTopic("getPosition");
+                        f.WithQualityOfServiceLevel(MqttQualityOfServiceLevel.ExactlyOnce);
+                    })
+                    .Build();
+
+                var response = await mqttClient.SubscribeAsync(subscribeOptions);
+
+                subscribedToDesiredPosition = response.Items.Any(i => i.TopicFilter.Topic == "desiredPosition" && i.ResultCode == MqttClientSubscribeResultCode.GrantedQoS2);
+                subscribedToGetPosition = response.Items.Any(i => i.TopicFilter.Topic == "getPosition" && i.ResultCode == MqttClientSubscribeResultCode.GrantedQoS2);
+
+                await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (Exception ex)
+        {
+            mqttConnected = false;
+            subscribedToDesiredPosition = false;
+            subscribedToGetPosition = false;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (mqttClient != null && mqttClient.IsConnected)
+        {
+            await mqttClient.DisconnectAsync();
+            mqttClient.Dispose();
+        }
+    }
+
+    private async Task GetBluetoothDevice()
+    {
+        try
+        {
+            isConnecting = true;
+            status = "Requesting device...";
+
+            var requestOptions = new RequestDeviceOptions
+            {
+                OptionalServices = serviceUuids.ToList(),
+                Filters = new List<Filter>
+                {
+                    new() { NamePrefix = "RobotArm" },
+                    new() { NamePrefix = "Zephyr" }
+                }
+            };
+
+            device = await navigator.RequestDevice(requestOptions);
+            device.OnGattServerDisconnected += OnGattServerDisconnected;
+
+            if (device != null)
+            {
+                lastSelectedDevice = new DeviceInfo { Name = device.Name, Id = device.Id }; // Store device info
+                var lastDeviceJson = JsonSerializer.Serialize(lastSelectedDevice);
+                await JSRuntime.InvokeVoidAsync("localStorage.setItem", "lastSelectedDevice", lastDeviceJson);
+
+                status = $"Device selected: {device.Name} ({device.Id})";
+
+                isUserDisconnected = false;
+                await device.Gatt.Connect();
+
+                if (device.Gatt.Connected)
+                {
+                    isConnected = true;
+                    status = "";
+                    await ReadServices(device);
+                }
+                else
+                {
+                    status = $"Failed to connect to: {device.Name}";
+                }
+            }
+            else
+            {
+                status = "No device selected.";
+            }
+        }
+        catch (Exception ex)
+        {
+            status = $"Error: {ex.Message}";
+        }
+        finally
+        {
+            isConnecting = false;
+        }
+    }
+
+    private async Task ReconnectToLastDevice()
+    {
+        if (lastSelectedDevice == null)
+        {
+            status = "No previously selected device available.";
+            return;
+        }
+
+        try
+        {
+            // Reset the user disconnect flag when user explicitly requests a reconnection
+            status = $"Reconnecting to: {lastSelectedDevice.Name}...";
+
+            if (device == null)
+            {
+                var requestOptions = new RequestDeviceOptions
+                {
+                    OptionalServices = serviceUuids.ToList(),
+                    Filters = new List<Filter>
+                    {
+                        new() { NamePrefix = "RobotArm" },
+                        new() { NamePrefix = "Zephyr" }
+                    }
+                };
+
+                device = await navigator.RequestDevice(requestOptions);
+            }
+
+            if (device == null)
+            {
+                status = "No device selected.";
+                return;
+            }
+
+            device.OnGattServerDisconnected += OnGattServerDisconnected;
+            status = $"Device selected: {device.Name} ({device.Id})";
+
+            isUserDisconnected = false;
+            await device.Gatt.Connect();
+
+            if (device.Gatt.Connected)
+            {
+                isConnected = true;
+                status = "";
+                await ReadServices(device);
+
+                // Update stored device info
+                lastSelectedDevice = new DeviceInfo { Name = device.Name, Id = device.Id };
+                var lastDeviceJson = JsonSerializer.Serialize(lastSelectedDevice);
+                await JSRuntime.InvokeVoidAsync("localStorage.setItem", "lastSelectedDevice", lastDeviceJson);
+            }
+            else
+            {
+                status = $"Failed to connect to: {device.Name}";
+            }
+        }
+        catch (Exception ex)
+        {
+            status = $"Error during reconnect: {ex.Message}";
+            isConnected = false;
+        }
+    }
+
+    private async void OnGattServerDisconnected()
+    {
+        if (isUserDisconnected)
+        {
+            return;
+        }
+
+        try
+        {
+            // Only attempt reconnection if it wasn't a user-initiated disconnect
+            status = "Device disconnected unexpectedly. Attempting to reconnect...";
+            isConnected = false;
+
+            await CleanupAfterDisconnect("Device disconnected.");
+
+            // Clear data about storing current positions
+            lastReportedData = null;
+
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            status = $"Error in disconnect handler: {ex.Message}";
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task PublishReportedPosition()
+    {
+        if (!isConnected || mqttClient?.IsConnected != true || lastReportedData == null)
+        {
+            status = "Cannot publish: Bluetooth or MQTT is not connected.";
+            return; // Do not send data if not connected
+        }
+
+        var json = JsonSerializer.Serialize(lastReportedData);
+        var message = new MqttApplicationMessageBuilder()
+            .WithTopic("reportedPosition")
+            .WithPayload(json)
+            .WithQualityOfServiceLevel(MqttQualityOfServiceLevel.ExactlyOnce)
+            .Build();
+
+        await mqttClient.PublishAsync(message);
+    }
+
+    private async Task CleanupAfterDisconnect(string disconnectMessage)
+    {
+        try
+        {
+            foreach (var characteristic in subscribedCharacteristics)
+            {
+                characteristic.OnRaiseCharacteristicValueChanged -= OnCharacteristicValueChanged;
+                await characteristic.StopNotifications();
+            }
+
+            subscribedCharacteristics.Clear();
+        }
+        catch
+        {
+            // Ignore errors
+        }
+
+        writableCharacteristic = null;
+        deviceInfo = null;
+        liveDataHex = null;
+        status = disconnectMessage;
+        isConnected = false;
+
+        try
+        {
+            await InvokeAsync(StateHasChanged);
+        }
+        catch
+        {
+            // Component might be disposed, safe to ignore
+        }
+    }
+
+    private async Task DisconnectDevice()
+    {
+        isUserDisconnected = true; // Mark as intentionally disconnected
+
+        try
+        {
+            if (device?.Gatt?.Connected == true)
+            {
+                await device.Gatt.Disonnect();
+            }
+
+            await CleanupAfterDisconnect($"Disconnected from: {lastSelectedDevice?.Name}");
+        }
+        catch (Exception ex)
+        {
+            status = $"Error during disconnect: {ex.Message}";
+        }
+    }
+
+    private async Task ReadServices(IDevice device)
+    {
+        try
+        {
+            deviceInfo = "";
+
+            foreach (var uuid in serviceUuids)
+            {
+                var services = await device.Gatt.GetPrimaryServices(uuid);
+
+                foreach (var service in services)
+                {
+                    deviceInfo += $"Service: {service.Uuid}\n";
+                    var characteristics = await service.GetCharacteristics();
+
+                    foreach (var characteristic in characteristics)
+                    {
+                        @* var props = characteristic.Properties.ToString(); *@
+                        deviceInfo += $"  Characteristic: {characteristic.Uuid}\n";
+
+                        if (characteristic.Properties.Read)
+                        {
+                            try
+                            {
+                                var bytes = await characteristic.ReadValue();
+                                SetLiveDataHex(bytes, service.Uuid, characteristic.Uuid);
+                            }
+                            catch
+                            {
+                                deviceInfo += $"    Value: [Read failed]\n";
+                            }
+                        }
+
+                        if (characteristic.Properties.Notify)
+                        {
+                            await characteristic.StartNotifications();
+                            characteristic.OnRaiseCharacteristicValueChanged += OnCharacteristicValueChanged;
+                            subscribedCharacteristics.Add(characteristic);
+                            deviceInfo += $"    Notifications: Subscribed\n";
+                        }
+
+                        if (writableCharacteristic == null && characteristic.Properties.Write)
+                        {
+                            writableCharacteristic = characteristic;
+                            deviceInfo += $"    Writable characteristic selected.\n";
+                        }
+                    }
+
+                    deviceInfo += "\n";
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            deviceInfo = $"Error reading services: {ex.Message}";
+        }
+    }
+
+    private void SetLiveDataHex(byte[] bytes, string serviceId, string charId)
+    {
+        var asHex = BitConverter.ToString(bytes);
+
+        var angles = new List<ushort>();
+        for (int i = 0; i < 10 && i + 1 < bytes.Length; i += 2)
+        {
+            ushort angle = (ushort)(bytes[i] | (bytes[i + 1] << 8));
+            angles.Add(angle);
+        }
+
+        string gripperState = (bytes.Length >= 3 && bytes[^3] == 0) ? "Closed" : "Open";
+        string angleStr = string.Join(", ", angles);
+
+        liveDataHex = $"{asHex}  ({angleStr}, {gripperState})\n\nFrom:\n  Service: {serviceId}\n  Characteristic: {charId}";
+
+        // Create a DataModel from the actual Bluetooth data
+        var reportedData = new DataModel
+        {
+            Angle0 = angles.Count > 0 ? angles[0] : 0,
+            Angle1 = angles.Count > 1 ? angles[1] : 0,
+            Angle2 = angles.Count > 2 ? angles[2] : 0,
+            Angle3 = angles.Count > 3 ? angles[3] : 0,
+            Angle4 = angles.Count > 4 ? angles[4] : 0,
+            GripperOpen = gripperState == "Open"
+        };
+
+        // Store the reported data for MQTT publishing
+        lastReportedData = reportedData;
+    }
+
+    private async void OnCharacteristicValueChanged(object? sender, CharacteristicEventArgs e)
+    {
+        try
+        {
+            if (!isConnected || mqttClient?.IsConnected != true)
+            {
+                status = "Cannot publish: Bluetooth or MQTT is not connected.";
+                return; // Do not process notifications if not connected
+            }
+
+            SetLiveDataHex(e.Value, e.ServiceId.ToString(), e.CharacteristicId.ToString());
+
+            // Publish the actual position from Bluetooth to MQTT
+            await PublishReportedPosition();
+
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            liveDataHex = $"[Notification error]: {ex.Message}";
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private async Task SendData()
+    {
+        if (writableCharacteristic == null)
+        {
+            status = "No writable characteristic available.";
+            return;
+        }
+
+        var bytes = new List<byte>();
+
+        ushort[] angles =
+        {
+            (ushort)Math.Clamp(dataToSend.Angle0, 0, 360),
+            (ushort)Math.Clamp(dataToSend.Angle1, 0, 360),
+            (ushort)Math.Clamp(dataToSend.Angle2, 0, 360),
+            (ushort)Math.Clamp(dataToSend.Angle3, 0, 360),
+            (ushort)Math.Clamp(dataToSend.Angle4, 0, 360)
+        };
+
+        foreach (var angle in angles)
+        {
+            bytes.Add((byte)(angle & 0xFF));
+            bytes.Add((byte)((angle >> 8) & 0xFF));
+        }
+
+        bytes.Add((byte)(dataToSend.GripperOpen ? 1 : 0));
+        bytes.Add(0x20);
+        bytes.Add(0x01);
+
+        try
+        {
+            await writableCharacteristic.WriteValueWithResponse(bytes.ToArray());
+            status = "Data sent successfully.";
+
+            SetLiveDataHex(bytes.ToArray(), writableCharacteristic.ServiceUuid, writableCharacteristic.Uuid);
+            await InvokeAsync(StateHasChanged);
+        }
+        catch (Exception ex)
+        {
+            status = $"Failed to send data: {ex.Message}";
+        }
+    }
+
+    private class DeviceInfo
+    {
+        public string Name { get; set; } = string.Empty;
+        public string Id { get; set; } = string.Empty;
+    }
+}

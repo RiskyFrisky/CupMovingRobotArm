@@ -1,0 +1,27 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BluetoothWebApp", "BluetoothWebApp\BluetoothWebApp.csproj", "{0BFA2490-49C1-4819-B31D-F3EE9A458F84}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TestMqttBroker", "TestMqttBroker\TestMqttBroker.csproj", "{F6B013F4-64CE-41B1-BFBB-65D7B594A224}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionFolder", "{7A9599C2-8A1B-4106-BD7C-6365A2C6BE49}"
+	ProjectSection(SolutionItems) = preProject
+		README.md = README.md
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{0BFA2490-49C1-4819-B31D-F3EE9A458F84}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{0BFA2490-49C1-4819-B31D-F3EE9A458F84}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{0BFA2490-49C1-4819-B31D-F3EE9A458F84}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{0BFA2490-49C1-4819-B31D-F3EE9A458F84}.Release|Any CPU.Build.0 = Release|Any CPU
+		{F6B013F4-64CE-41B1-BFBB-65D7B594A224}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F6B013F4-64CE-41B1-BFBB-65D7B594A224}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F6B013F4-64CE-41B1-BFBB-65D7B594A224}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F6B013F4-64CE-41B1-BFBB-65D7B594A224}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
