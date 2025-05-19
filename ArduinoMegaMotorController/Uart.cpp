@@ -9,7 +9,7 @@ volatile unsigned int jointAngles[5] = {0};
 volatile unsigned int gripperState = 0;
 
 void initUART() {
-  Serial1.begin(9600);
+  Serial1.begin(115200);
 }
 
 void parseUARTMessage(const char* msg) {
