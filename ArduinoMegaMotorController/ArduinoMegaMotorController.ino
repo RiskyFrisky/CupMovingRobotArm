@@ -1,12 +1,14 @@
 #include <AccelStepper.h>
+#include "Uart.h"
 
 // Define stepper motor connections
-#define STEP_PIN 2  // Change these pin numbers according to your setup
-#define DIR_PIN  3
+#define ANGLE1_STEP_PIN 2
+#define ANGLE1_DIR_PIN  3
+
 #define MOTOR_INTERFACE_TYPE 1 // Driver interface type
 
 // Create a new instance of the AccelStepper class
-AccelStepper stepper(MOTOR_INTERFACE_TYPE, STEP_PIN, DIR_PIN);
+AccelStepper stepper(MOTOR_INTERFACE_TYPE, ANGLE1_STEP_PIN, ANGLE1_DIR_PIN);
 
 // Constants for motor configuration
 const int STEPS_PER_REVOLUTION = 16 * 200;  // Correct for NEMA 17 (1.8° per step)
@@ -26,6 +28,8 @@ void setup() {
   Serial.println(" degrees per second");
   Serial.print("Calculated steps per second: ");
   Serial.println(SPEED);
+
+  initUART(); // Initialize Serial1 for UART
 }
 
 // Function to convert angle to steps
@@ -87,7 +91,25 @@ void rotateAngle(AccelStepper &stepper, float angle) {
 }
 
 void loop() {
-  // Example: rotate 360 degrees clockwise, then 360 counterclockwise
-  rotateAngle(stepper, 360);
-  rotateAngle(stepper, -360);
+  checkUART(); // Check for new UART messages and update jointAngles/gripperState
+
+  // Print received values
+  Serial.print("Angles: ");
+  for (int i = 0; i < 5; ++i) {
+    Serial.print(jointAngles[i]);
+    Serial.print(i < 4 ? ", " : "");
+  }
+  Serial.print(" | Gripper: ");
+  Serial.println(gripperState);
+
+  // Move the stepper to the target angle (angle 1)
+  static float lastAngle = 0;
+  float targetAngle = jointAngles[0];
+  if (targetAngle != lastAngle) {
+    float delta = targetAngle - lastAngle;
+    rotateAngle(stepper, delta);
+    lastAngle = targetAngle;
+  }
+
+  delay(10);
 }
